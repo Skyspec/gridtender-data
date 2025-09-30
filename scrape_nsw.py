@@ -11,42 +11,59 @@ BASE = "https://buy.nsw.gov.au"
 LIST_URL = f"{BASE}/opportunity/search?types=Tenders"
 
 # ---- Runtime knobs (via workflow inputs / env) ----
-PAGES          = int(os.getenv("PAGES", "1") or "1")            # listing pages to scan
-DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")   # how many detail pages to peek (text only)
-TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")        # HTTP timeout
+PAGES          = int(os.getenv("PAGES", "2") or "2")             # listing pages to scan
+DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")    # how many detail pages to peek (text only)
+TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")         # HTTP timeout
 ONLY_FILTERED  = os.getenv("ONLY_FILTERED", "1").lower() in ("1","true","yes","y")
+DRONE_REQUIRED = os.getenv("DRONE_REQUIRED", "1").lower() in ("1","true","yes","y")  # <- require drone signal
 
-# ---- Broadened filters (drone-first, energy boosted) ----
-DRONE_PATTERNS = [
-    r"\bdrone(s)?\b", r"\buas\b", r"\buav(s)?\b", r"\brpas\b",
+# ---- Drone & Energy filters (strict) ----
+# We only count *explicit* drone signals. Generic words like "inspection" or "survey" are excluded
+# unless they are explicitly "aerial <survey|inspection|mapping|photography>".
+PRIMARY_DRONE_PATTERNS = [
+    r"\bdrone(s)?\b",
+    r"\buas\b",
+    r"\buav(s)?\b",
+    r"\brpas\b",
     r"\bremotely[- ]?piloted\b",
-    r"\bthermal\b", r"\bthermograph(y|ic)\b", r"\binfrared\b", r"\bIR\b",
-    r"\bLiDAR\b", r"\bphotogrammetr(y|ic)\b",
-    r"\baerial (survey|inspection|mapping|photography)\b",
-    r"\binspection(s)?\b", r"\bsurvey(s|ing)?\b", r"\bmapping\b",
-    r"\bcondition assessment\b", r"\bvegetation (management|encroachment|clearance)\b",
-    r"\bimag(e|ing)\b", r"\bcamera\b", r"\bUAV pilot\b"
+    r"\bLiDAR\b",
+    r"\bthermograph(?:y|ic)\b",
+    r"\binfrared\b",
+    r"\bIR\b",
+    r"\baerial\s+(?:survey|inspection|mapping|photography)\b",
 ]
-
 ENERGY_PATTERNS = [
     r"\bsolar\b", r"\bPV\b", r"\bphotovoltaic\b",
     r"\bwind\b", r"\bturbine(s)?\b",
     r"\brenewable(s)?\b", r"\benergy\b",
     r"\bsubstation\b", r"\btransmission\b", r"\bdistribution\b",
-    r"\bbattery( storage)?\b", r"\bBESS\b",
-    r"\bO&M\b", r"\boperations? and maintenance\b", r"\bfarm\b"
+    r"\bbattery(?:\s+storage)?\b", r"\bBESS\b",
+    r"\bO&M\b", r"\boperations?\s+and\s+maintenance\b", r"\bfarm\b"
 ]
 
-DRONE_RE = re.compile("|".join(DRONE_PATTERNS), re.I)
+DRONE_RE = re.compile("|".join(PRIMARY_DRONE_PATTERNS), re.I)
 ENERGY_RE = re.compile("|".join(ENERGY_PATTERNS), re.I)
 
-def score_text(txt: str) -> Tuple[int, Dict[str,int]]:
-    """Return (score, breakdown). Energy is weighted higher to prioritize energy-sector drone work."""
-    txt = txt or ""
-    drone_hits = len(re.findall(DRONE_RE, txt))
-    energy_hits = len(re.findall(ENERGY_RE, txt))
-    score = 2 * drone_hits + 3 * energy_hits
-    return score, {"drone": drone_hits, "energy": energy_hits}
+def count_hits(regex: re.Pattern, text: str) -> int:
+    return len(regex.findall(text or ""))
+
+def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
+    """
+    Title hits are worth more. Energy boosts ranking but cannot qualify alone if DRONE_REQUIRED=1.
+    """
+    t_drone = count_hits(DRONE_RE, title)
+    b_drone = count_hits(DRONE_RE, body)
+    t_energy = count_hits(ENERGY_RE, title)
+    b_energy = count_hits(ENERGY_RE, body)
+
+    # Drone signals (title weighted 3, body 2)
+    drone_score = 3 * t_drone + 2 * b_drone
+    # Energy bonus (title weighted 2, body 1)
+    energy_score = 2 * t_energy + 1 * b_energy
+
+    score = drone_score + energy_score
+    hits = {"drone_title": t_drone, "drone_body": b_drone, "energy_title": t_energy, "energy_body": b_energy}
+    return score, hits
 
 # ---- HTTP helpers ----
 def make_session() -> requests.Session:
@@ -54,7 +71,7 @@ def make_session() -> requests.Session:
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36 GridTender/0.1")
+                       "Chrome/126.0 Safari/537.36 GridTender/0.2")
     })
     return s
 
@@ -73,7 +90,7 @@ def fetch(url: str, session: requests.Session, timeout: int = TIMEOUT) -> str:
 def parse_listing(html: str) -> List[Dict]:
     """Return [{'href': '/prcOpportunity/...', 'text': '...'}] from listing HTML."""
     out, seen = [], set()
-    if not html: 
+    if not html:
         return out
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
@@ -143,14 +160,23 @@ def run():
         href = it["href"]
         url = urljoin(BASE, href)
         dt = details_text.get(href, {})
-        title = dt.get("title") or link_title_from_href(href, it.get("text", ""))
-        score, breakdown = score_text(" ".join([it.get("text", ""), dt.get("title", ""), dt.get("body", "")]))
+        title_text = dt.get("title") or link_title_from_href(href, it.get("text", ""))
+        body_text  = dt.get("body", "")
+        score, hits = score_from(title_text, body_text)
+
+        # Decide inclusion:
+        # - If DRONE_REQUIRED=1: require at least ONE drone hit in title or body.
+        # - If DRONE_REQUIRED=0: include everything (energy still boosts the score).
+        drone_hits_total = hits["drone_title"] + hits["drone_body"]
+        include = (drone_hits_total > 0) if DRONE_REQUIRED else True
+
         rows_all.append({
-            "title": title,
+            "title": title_text,
             "source_url": url,
             "state": "NSW",
             "score": score,
-            "hits": breakdown
+            "hits": hits,
+            "include": include
         })
 
     # Sort: highest score first, then title
@@ -158,7 +184,7 @@ def run():
 
     # Filtered view; fallback to top 20 if empty so it's never blank
     if ONLY_FILTERED:
-        rows_filtered = [r for r in rows_all if r["score"] > 0]
+        rows_filtered = [r for r in rows_all if r["include"]]
         if not rows_filtered:
             rows_filtered = rows_all[:20]
     else:
@@ -171,7 +197,7 @@ def run():
     with open("nsw-links.json", "w", encoding="utf-8") as f:
         json.dump(rows_filtered, f, ensure_ascii=False, indent=2)
 
-    logging.info(f"Wrote {len(rows_filtered)} filtered rows (out of {len(rows_all)} total).")
+    logging.info(f"Wrote {len(rows_filtered)} filtered rows (out of {len(rows_all)} total). DRONE_REQUIRED={DRONE_REQUIRED}")
     print("OK")
 
 if __name__ == "__main__":
