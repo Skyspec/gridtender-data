@@ -6,13 +6,13 @@ on:
       pages:
         description: "Listing pages to scan"
         required: false
-        default: "1"
+        default: "2"
       detail_limit:
         description: "Detail pages to peek (for filtering)"
         required: false
-        default: "20"
+        default: "40"
       only_filtered:
-        description: "1=only filtered, 0=all"
+        description: "1=only filtered (with fallback), 0=all"
         required: false
         default: "1"
 
@@ -35,14 +35,13 @@ jobs:
 
       - name: Scrape NSW
         env:
-          PAGES: ${{ github.event.inputs.pages || '1' }}
-          DETAIL_LIMIT: ${{ github.event.inputs.detail_limit || '20' }}
+          PAGES: ${{ github.event.inputs.pages || '2' }}
+          DETAIL_LIMIT: ${{ github.event.inputs.detail_limit || '40' }}
           ONLY_FILTERED: ${{ github.event.inputs.only_filtered || '1' }}
         run: |
           set -e
           python scrape_nsw.py
-          echo "Preview nsw-links.json:"
-          head -n 60 nsw-links.json || true
+          echo "Preview nsw-links.json:"; head -n 60 nsw-links.json || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
