@@ -9,13 +9,15 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # ---- QLD (QTenders) ----
 BASE = "https://qtenders.epw.qld.gov.au"
-# We’ll try these list URLs in order until we get links:
+
+# Reliable listing endpoints (we'll try in order until we see detail links)
 LIST_URL_CANDIDATES = [
-    # Common “open tenders” listing
-    f"{BASE}/qtenders/tender/search/tender-search.do?openTenders=true",
-    # Alternate listings seen historically
-    f"{BASE}/qtenders/tender/search/tender-search.do?type=OPEN",
-    f"{BASE}/qtenders/",
+    # Official "Open tenders" advanced search
+    f"{BASE}/qtenders/tender/search/tender-search.do?action=advanced-tender-search-open-tender",
+    # Alternate "do-advanced" with explicit Open state
+    f"{BASE}/qtenders/tender/search/tender-search.do?action=do-advanced-tender-search&state=Open",
+    # Basic entry (sometimes contains the list for not-logged-in users)
+    f"{BASE}/qtenders/qtenders/",
 ]
 
 # ---- Runtime knobs (via workflow inputs / env) ----
@@ -23,21 +25,13 @@ PAGES          = int(os.getenv("PAGES", "2") or "2")            # listing pages 
 DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")   # how many detail pages to peek (text only)
 TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")        # HTTP timeout
 ONLY_FILTERED  = os.getenv("ONLY_FILTERED", "1").lower() in ("1","true","yes","y")
+DRONE_REQUIRED = True  # strict like NSW
 
-# Require a drone signal (like NSW strict)
-DRONE_REQUIRED = True
-
-# ---- Drone & Energy filters (same as NSW strict) ----
+# ---- Drone & Energy filters (strict) ----
 PRIMARY_DRONE_PATTERNS = [
-    r"\bdrone(s)?\b",
-    r"\buas\b",
-    r"\buav(s)?\b",
-    r"\brpas\b",
-    r"\bremotely[- ]?piloted\b",
-    r"\bLiDAR\b",
-    r"\bthermograph(?:y|ic)\b",
-    r"\binfrared\b",
-    r"\bIR\b",
+    r"\bdrone(s)?\b", r"\buas\b", r"\buav(s)?\b", r"\brpas\b",
+    r"\bremotely[- ]?piloted\b", r"\bLiDAR\b",
+    r"\bthermograph(?:y|ic)\b", r"\binfrared\b", r"\bIR\b",
     r"\baerial\s+(?:survey|inspection|mapping|photography)\b",
 ]
 ENERGY_PATTERNS = [
@@ -70,7 +64,7 @@ def make_session() -> requests.Session:
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36 GridTender/QLD-0.1")
+                       "Chrome/126.0 Safari/537.36 GridTender/QLD-0.2")
     })
     return s
 
@@ -87,31 +81,27 @@ def fetch(url: str, session: requests.Session, timeout: int = TIMEOUT) -> str:
 
 # ---- Parsing ----
 def normalize_url(base: str, href: str) -> str:
-    """Make absolute URL and strip fragments."""
     if not href:
         return ""
     if not href.startswith("http"):
         href = urljoin(base, href)
     parts = list(urlparse(href))
-    parts[5] = ""  # remove fragment
+    parts[5] = ""  # strip fragment
     return urlunparse(parts)
 
 def parse_listing_for_detail_links(html: str) -> List[Dict]:
     """
-    Return [{'href': '/qtenders/tender/display/tender-details.do?...', 'text': '...'}].
-    We accept detail links that contain both 'tender' and 'detail' to avoid nav links.
+    Return [{'href': '<abs>', 'text': '...'}] for QTenders detail pages.
+    We match links that include 'tender/display' AND 'tender-details' to avoid nav/JS links.
     """
     out, seen = [], set()
     if not html:
         return out
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
-        h = a.get("href", "")
-        h_abs = normalize_url(BASE, h)
-        h_low = h_abs.lower()
-        # Heuristics for QTenders detail pages:
-        # - contains "/qtenders/" AND "tender" AND ("detail" or "details")
-        if ("/qtenders/" in h_low) and ("tender" in h_low) and ("detail" in h_low):
+        h_abs = normalize_url(BASE, a.get("href", ""))
+        low = h_abs.lower()
+        if ("/tender/display/" in low) and ("tender-details" in low):
             if h_abs not in seen:
                 seen.add(h_abs)
                 txt = (a.get_text(strip=True) or "")
@@ -119,20 +109,17 @@ def parse_listing_for_detail_links(html: str) -> List[Dict]:
     return out
 
 def add_pagination(url: str, page_num: int) -> str:
-    """
-    Try common QTenders paging params. We’ll generate a few candidate URLs for page N.
-    """
+    """Generate page N by setting currentPage=N when applicable."""
     if page_num <= 1:
         return url
     u = urlparse(url)
     qs = parse_qs(u.query)
-    # Try currentPage
     qs["currentPage"] = [str(page_num)]
     url1 = u._replace(query=urlencode(qs, doseq=True))
     return urlunparse(url1)
 
 def parse_detail_title_and_body(html: str) -> Tuple[str, str]:
-    """Basic, no-JS parse."""
+    """Basic parse (no JS)."""
     if not html:
         return "", ""
     soup = BeautifulSoup(html, "html.parser")
@@ -157,7 +144,6 @@ def count_hits(regex: re.Pattern, text: str) -> int:
     return len(regex.findall(text or ""))
 
 def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
-    # Drone (title x3, body x2) ; Energy (title x2, body x1)
     t_drone  = count_hits(DRONE_RE, title)
     b_drone  = count_hits(DRONE_RE, body)
     t_energy = count_hits(ENERGY_RE, title)
@@ -172,40 +158,46 @@ def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
 def run():
     session = make_session()
 
-    # 1) Find a listing URL that yields detail links
-    chosen_url = None
-    first_links: List[Dict] = []
+    # 1) Probe listing endpoints until we see detail links
+    chosen = None
+    page1_links: List[Dict] = []
+    page1_html_dump = ""
     for cand in LIST_URL_CANDIDATES:
         html = fetch(cand, session)
         links = parse_listing_for_detail_links(html)
-        logging.info(f"Probe '{cand}' -> {len(links)} detail link(s)")
+        logging.info(f"Probe {cand} -> {len(links)} detail link(s)")
+        if not chosen:
+            page1_html_dump = html  # keep first for debugging if needed
         if links:
-            chosen_url = cand
-            first_links = links
+            chosen = cand
+            page1_links = links
             break
 
-    if not chosen_url:
-        # Write empty outputs with note and return
-        rows_all: List[Dict] = []
+    if not chosen:
+        # Save first listing HTML for inspection and exit gracefully
+        try:
+            with open("qld-listing.html", "w", encoding="utf-8") as f:
+                f.write(page1_html_dump or "")
+        except Exception:
+            pass
         with open("qld-raw.json", "w", encoding="utf-8") as f:
-            json.dump(rows_all, f, ensure_ascii=False, indent=2)
+            json.dump([], f, ensure_ascii=False, indent=2)
         with open("qld-links.json", "w", encoding="utf-8") as f:
-            json.dump(rows_all, f, ensure_ascii=False, indent=2)
-        logging.warning("No QLD listing produced links (site layout may have changed).")
+            json.dump([], f, ensure_ascii=False, indent=2)
+        logging.warning("QLD: No detail links found. Wrote qld-listing.html for debugging.")
         print("OK (no links)")
         return
 
     # 2) Collect across pages
     all_items: List[Dict] = []
     for i in range(1, max(1, PAGES) + 1):
-        url_i = chosen_url if i == 1 else add_pagination(chosen_url, i)
+        url_i = chosen if i == 1 else add_pagination(chosen, i)
         logging.info(f"Listing page {i}: {url_i}")
         html = fetch(url_i, session)
         items = parse_listing_for_detail_links(html)
-        # If page 1 and probe had links, reuse to avoid re-parsing
-        if i == 1 and first_links:
-            items = first_links
-            first_links = []
+        if i == 1 and page1_links:
+            items = page1_links
+            page1_links = []
         logging.info(f"  found {len(items)} detail anchor(s)")
         all_items.extend(items)
         time.sleep(0.3 + random.uniform(0, 0.3))
@@ -251,11 +243,10 @@ def run():
             "include": include
         })
 
-    # Sort and choose filtered output
+    # Sort & output
     rows_all.sort(key=lambda r: (-r["score"], r["title"].lower()))
     rows_out = [r for r in rows_all if r["include"]] if ONLY_FILTERED else rows_all
 
-    # 5) Write files
     with open("qld-raw.json", "w", encoding="utf-8") as f:
         json.dump(rows_all, f, ensure_ascii=False, indent=2)
     with open("qld-links.json", "w", encoding="utf-8") as f:
