@@ -123,19 +123,21 @@ jobs:
             out/**
             au-tenders-*.zip
 
-      # ---- Email via Microsoft 365 (Exchange Online) ----
+      # ---- Email via Microsoft 365 (STARTTLS on 587) ----
       - name: Send email (Microsoft 365)
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.office365.com
           server_port: 587
-          secure: true
+          # IMPORTANT: For STARTTLS on 587, leave secure unset or false:
+          secure: false
           username: admin@skyspec.com.au
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "AU Drone/Energy tenders — NSW/QLD/VIC"
           to: admin@skyspec.com.au
           from: "Skyspec Tenders <admin@skyspec.com.au>"
-          html_body: file://out/email_body.html   # <-- use html_body (not content_type)
+          html_body: file://out/email_body.html
+          nodemailerdebug: true
           attachments: >
             au-tenders-*.zip,
             out/nsw-links.json,out/nsw-near.json,out/nsw-raw.json,
