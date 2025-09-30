@@ -7,28 +7,29 @@ from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# ---- VIC (TendersVIC / Buying for Victoria) ----
-# The public portal has historically served listings at tenders.vic.gov.au and paths under /tender/search.
-# We’ll probe a few candidates and pick the first that yields detail links.
+# ---- VIC (Buying for Victoria / TendersVIC) ----
 BASE = "https://www.tenders.vic.gov.au"
 
+# Probe these in order; we’ll pick the first that yields detail links
 LIST_URL_CANDIDATES = [
-    # Common “open tenders” search (older endpoints still present on many installs)
-    f"{BASE}/tender/search/tenders?status=open",
-    f"{BASE}/tender/search/tenders?status=Open",
-    f"{BASE}/tender/search/tenders",
-    # Root as a last resort (some instances render listings on the home page for unauth users)
+    # Known to render without JS for many users:
+    f"{BASE}/tender/search?preset=open",
+    # Explicit query params variant (also server-rendered):
+    f"{BASE}/tender/search?tenderState=OPEN&groupBy=NONE&openThisWeek=false&closeThisWeek=false&awardedThisWeek=false",
+    # Generic search (may list open by default):
+    f"{BASE}/tender/search",
+    # As a last resort, site root (rarely helpful but harmless):
     f"{BASE}/",
 ]
 
-# ---- Runtime knobs (via workflow inputs / env) ----
-PAGES          = int(os.getenv("PAGES", "2") or "2")             # listing pages to scan
-DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")    # how many detail pages to peek (text only)
-TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")         # HTTP timeout
+# ---- Runtime knobs ----
+PAGES          = int(os.getenv("PAGES", "2") or "2")
+DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")
+TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")
 ONLY_FILTERED  = os.getenv("ONLY_FILTERED", "1").lower() in ("1","true","yes","y")
 WRITE_NEAR     = os.getenv("WRITE_NEAR", "1").lower() in ("1","true","yes","y")
 
-# Strict: a drone signal is required for vic-links.json
+# Strict: must have explicit drone signal for vic-links.json
 DRONE_REQUIRED = True
 
 # ---- Drone & Energy filters (same as NSW/QLD strict) ----
@@ -46,7 +47,6 @@ ENERGY_PATTERNS = [
     r"\bbattery(?:\s+storage)?\b", r"\bBESS\b",
     r"\bO&M\b", r"\boperations?\s+and\s+maintenance\b", r"\bfarm\b"
 ]
-# Generic work words for near-miss detection (only when no drone hit)
 GENERIC_WORK_PATTERNS = [
     r"\binspect(?:ion|ions)?\b",
     r"\bsurvey(?:s|ing)?\b",
@@ -55,7 +55,6 @@ GENERIC_WORK_PATTERNS = [
     r"\bcondition\s+assessment\b",
     r"\bvegetation\b",
 ]
-# Non-drone advisory/strategy tenders to ignore unless a drone signal is present
 NEGATIVE_PATTERNS = [
     r"\bconnecting with country\b",
     r"\bdesign review panel\b",
@@ -79,12 +78,11 @@ def make_session() -> requests.Session:
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36 GridTender/VIC-0.1")
+                       "Chrome/126.0 Safari/537.36 GridTender/VIC-0.2")
     })
     return s
 
 def fetch(url: str, session: requests.Session, timeout: int = TIMEOUT) -> str:
-    """GET with simple retry and SSL verify fallback."""
     for i in range(2):
         try:
             r = session.get(url, timeout=timeout, allow_redirects=True, verify=(i == 0))
@@ -100,16 +98,17 @@ def normalize_url(base: str, href: str) -> str:
         return ""
     if not href.startswith("http"):
         href = urljoin(base, href)
-    parts = list(urlparse(href))
-    parts[5] = ""  # strip fragment
+    parts = list(urlparse(href)); parts[5] = ""  # strip fragment
     return urlunparse(parts)
 
 def parse_listing_for_detail_links(html: str) -> List[Dict]:
     """
     Return [{'href': '<abs>', 'text': '...'}] for VIC tender detail pages.
-    Heuristics:
-      - anchor href contains '/tender/' and ('view' or 'detail')
-      - avoid obvious nav/search links
+    Accept common detail URL shapes seen on tenders.vic.gov.au:
+      - /tender/details/...
+      - /tender/display/...
+      - /tender/view/...
+      - /tender/... with 'details' or 'view' in the path/query
     """
     out, seen = [], set()
     if not html:
@@ -118,9 +117,15 @@ def parse_listing_for_detail_links(html: str) -> List[Dict]:
     for a in soup.find_all("a", href=True):
         h_abs = normalize_url(BASE, a.get("href", ""))
         low = h_abs.lower()
-        if ("/tender/" in low) and (("view" in low) or ("detail" in low) or ("details" in low)):
-            # Skip search/listing/self links
-            if any(x in low for x in ["/tender/search", "/search/tenders", "/advanced", "status=", "page="]) and ("detail" not in low and "view" not in low):
+        is_detail = (
+            ("/tender/details" in low) or
+            ("/tender/display" in low) or
+            ("/tender/view" in low) or
+            ("/tender/" in low and ("detail" in low or "details" in low or "view" in low))
+        )
+        if is_detail:
+            # avoid obvious search/self links
+            if any(x in low for x in ["/tender/search", "/search/tenders"]) and ("detail" not in low and "view" not in low):
                 continue
             if h_abs not in seen:
                 seen.add(h_abs)
@@ -129,17 +134,12 @@ def parse_listing_for_detail_links(html: str) -> List[Dict]:
     return out
 
 def add_pagination(url: str, page_num: int) -> str:
-    """
-    Generate page N by setting common paging params (?page=N or &page=N).
-    If url already has query params, append/replace page=.
-    """
     if page_num <= 1:
         return url
     u = urlparse(url)
     qs = parse_qs(u.query)
     qs["page"] = [str(page_num)]
-    url1 = u._replace(query=urlencode(qs, doseq=True))
-    return urlunparse(url1)
+    return urlunparse(u._replace(query=urlencode(qs, doseq=True)))
 
 def parse_detail_title_and_body(html: str) -> Tuple[str, str]:
     if not html:
@@ -161,12 +161,10 @@ def link_title_from_href(href: str, text_hint: str) -> str:
     except Exception:
         return "Untitled"
 
-# ---- Scoring & inclusion ----
 def count_hits(regex: re.Pattern, text: str) -> int:
     return len(regex.findall(text or ""))
 
 def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
-    # Drone (title x3, body x2) ; Energy (title x2, body x1)
     t_drone  = count_hits(DRONE_RE, title)
     b_drone  = count_hits(DRONE_RE, body)
     t_energy = count_hits(ENERGY_RE, title)
@@ -181,32 +179,34 @@ def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
 def run():
     session = make_session()
 
-    # 1) Probe listing endpoints until we see detail links
+    # 1) Probe listing endpoints; ALWAYS save page-1 HTML for debugging
     chosen = None
     page1_links: List[Dict] = []
     page1_html_dump = ""
     for cand in LIST_URL_CANDIDATES:
         html = fetch(cand, session)
+        if not page1_html_dump:
+            page1_html_dump = html or ""
         links = parse_listing_for_detail_links(html)
         logging.info(f"Probe {cand} -> {len(links)} link(s)")
-        if not chosen:
-            page1_html_dump = html
         if links:
             chosen = cand
             page1_links = links
             break
 
+    # Save page-1 listing HTML unconditionally so we can inspect
+    try:
+        with open("vic-listing.html", "w", encoding="utf-8") as f:
+            f.write(page1_html_dump or "")
+    except Exception:
+        pass
+
     if not chosen:
-        # Save first listing HTML for inspection and exit gracefully
-        try:
-            with open("vic-listing.html", "w", encoding="utf-8") as f:
-                f.write(page1_html_dump or "")
-        except Exception:
-            pass
+        # No links discovered: write empty JSONs and exit gracefully
         for name in ("vic-raw.json", "vic-links.json", "vic-near.json"):
             with open(name, "w", encoding="utf-8") as f:
                 json.dump([], f, ensure_ascii=False, indent=2)
-        logging.warning("VIC: No detail links found. Wrote vic-listing.html for debugging.")
+        logging.warning("VIC: No detail links found in probed listings (see vic-listing.html).")
         print("OK (no links)")
         return
 
@@ -270,6 +270,7 @@ def run():
             "include": include_strict
         }
         rows_all.append(row)
+
         if include_near:
             rows_near.append({
                 "title": title_text,
