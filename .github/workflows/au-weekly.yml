@@ -45,18 +45,15 @@ jobs:
 
       # --- Run NSW ---
       - name: NSW
-        run: |
-          python scrape_nsw.py || true
+        run: python scrape_nsw.py || true
 
       # --- Run QLD ---
       - name: QLD
-        run: |
-          python scrape_qld.py || true
+        run: python scrape_qld.py || true
 
       # --- Run VIC ---
       - name: VIC
-        run: |
-          python scrape_vic.py || true
+        run: python scrape_vic.py || true
 
       - name: Collect outputs
         run: |
@@ -79,13 +76,12 @@ jobs:
           [ -f vic-debug-anchors.json ] && cp vic-debug-anchors.json out/vic-debug-anchors.json || true
 
       - name: Build HTML summary
-        id: summary
         run: |
           python - << 'PY'
           import json, os, datetime
-          def count(p):
+          def count(path):
             try:
-              with open(p,'r',encoding='utf-8') as f:
+              with open(path,'r',encoding='utf-8') as f:
                 return len(json.load(f))
             except Exception:
               return 0
@@ -133,14 +129,13 @@ jobs:
         with:
           server_address: smtp.office365.com
           server_port: 587
-          secure: true              # STARTTLS
+          secure: true
           username: admin@skyspec.com.au
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "AU Drone/Energy tenders — NSW/QLD/VIC"
           to: admin@skyspec.com.au
           from: "Skyspec Tenders <admin@skyspec.com.au>"
-          content_type: text/html
-          body: file://out/email_body.html
+          html_body: file://out/email_body.html   # <-- use html_body (not content_type)
           attachments: >
             au-tenders-*.zip,
             out/nsw-links.json,out/nsw-near.json,out/nsw-raw.json,
