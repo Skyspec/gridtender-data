@@ -7,19 +7,18 @@ from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# ---- VIC (Buying for Victoria / TendersVIC) ----
-BASE = "https://www.tenders.vic.gov.au"
+# ---- VIC endpoints ----
+BASES = [
+    "https://www.tenders.vic.gov.au",
+    # Same platform, alternate host (often used behind the scenes)
+    "https://vic.consolidatedtenders.com",
+]
 
-# Probe these in order; we’ll pick the first that yields detail links
 LIST_URL_CANDIDATES = [
-    # Known to render without JS for many users:
-    f"{BASE}/tender/search?preset=open",
-    # Explicit query params variant (also server-rendered):
-    f"{BASE}/tender/search?tenderState=OPEN&groupBy=NONE&openThisWeek=false&closeThisWeek=false&awardedThisWeek=false",
-    # Generic search (may list open by default):
-    f"{BASE}/tender/search",
-    # As a last resort, site root (rarely helpful but harmless):
-    f"{BASE}/",
+    "/tender/search?preset=open",
+    "/tender/search?tenderState=OPEN&groupBy=NONE&openThisWeek=false&closeThisWeek=false&awardedThisWeek=false",
+    "/tender/search",
+    "/",  # last resort
 ]
 
 # ---- Runtime knobs ----
@@ -29,10 +28,7 @@ TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")
 ONLY_FILTERED  = os.getenv("ONLY_FILTERED", "1").lower() in ("1","true","yes","y")
 WRITE_NEAR     = os.getenv("WRITE_NEAR", "1").lower() in ("1","true","yes","y")
 
-# Strict: must have explicit drone signal for vic-links.json
-DRONE_REQUIRED = True
-
-# ---- Drone & Energy filters (same as NSW/QLD strict) ----
+# ---- Filters (same logic as NSW/QLD) ----
 PRIMARY_DRONE_PATTERNS = [
     r"\bdrone(s)?\b", r"\buas\b", r"\buav(s)?\b", r"\brpas\b",
     r"\bremotely[- ]?piloted\b", r"\bLiDAR\b",
@@ -72,13 +68,12 @@ ENERGY_RE   = re.compile("|".join(ENERGY_PATTERNS), re.I)
 GENERIC_RE  = re.compile("|".join(GENERIC_WORK_PATTERNS), re.I)
 NEGATIVE_RE = re.compile("|".join(NEGATIVE_PATTERNS), re.I)
 
-# ---- HTTP helpers ----
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36 GridTender/VIC-0.2")
+                       "Chrome/126.0 Safari/537.36 GridTender/VIC-0.3")
     })
     return s
 
@@ -92,7 +87,6 @@ def fetch(url: str, session: requests.Session, timeout: int = TIMEOUT) -> str:
             pass
     return ""
 
-# ---- Parsing ----
 def normalize_url(base: str, href: str) -> str:
     if not href:
         return ""
@@ -101,37 +95,51 @@ def normalize_url(base: str, href: str) -> str:
     parts = list(urlparse(href)); parts[5] = ""  # strip fragment
     return urlunparse(parts)
 
-def parse_listing_for_detail_links(html: str) -> List[Dict]:
+def collect_link_candidates(html: str, base: str) -> List[Dict]:
     """
-    Return [{'href': '<abs>', 'text': '...'}] for VIC tender detail pages.
-    Accept common detail URL shapes seen on tenders.vic.gov.au:
-      - /tender/details/...
-      - /tender/display/...
-      - /tender/view/...
-      - /tender/... with 'details' or 'view' in the path/query
+    Return raw link-like candidates from anchors + common non-anchor patterns.
     """
-    out, seen = [], set()
+    out = []
     if not html:
         return out
     soup = BeautifulSoup(html, "html.parser")
+
+    # 1) Regular anchors
     for a in soup.find_all("a", href=True):
-        h_abs = normalize_url(BASE, a.get("href", ""))
-        low = h_abs.lower()
-        is_detail = (
-            ("/tender/details" in low) or
-            ("/tender/display" in low) or
-            ("/tender/view" in low) or
-            ("/tender/" in low and ("detail" in low or "details" in low or "view" in low))
-        )
-        if is_detail:
-            # avoid obvious search/self links
-            if any(x in low for x in ["/tender/search", "/search/tenders"]) and ("detail" not in low and "view" not in low):
-                continue
-            if h_abs not in seen:
-                seen.add(h_abs)
-                txt = (a.get_text(strip=True) or "")
-                out.append({"href": h_abs, "text": txt})
+        href = normalize_url(base, a.get("href", ""))
+        txt  = (a.get_text(strip=True) or "")
+        out.append({"href": href, "text": txt, "src": "a[href]"})
+    # 2) data-href attributes (rows clickable by JS)
+    for el in soup.find_all(attrs={"data-href": True}):
+        href = normalize_url(base, el.get("data-href", ""))
+        if href:
+            txt = (el.get_text(strip=True) or "")
+            out.append({"href": href, "text": txt, "src": "data-href"})
+    # 3) onclick="window.location='...'"
+    for el in soup.find_all(onclick=True):
+        oc = el.get("onclick") or ""
+        m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", oc)
+        if not m:
+            m = re.search(r"window\.location\s*=\s*['\"]([^'\"]+)['\"]", oc)
+        if m:
+            href = normalize_url(base, m.group(1))
+            txt  = (el.get_text(strip=True) or "")
+            out.append({"href": href, "text": txt, "src": "onclick"})
     return out
+
+DETAIL_PATTERNS = (
+    "/tender/view", "/tender/details", "/tender/display",
+    "/tender/detail",  # just in case
+)
+
+def is_detail_link(url: str) -> bool:
+    low = (url or "").lower()
+    if not low:
+        return False
+    if any(host in low for host in ["tenders.vic.gov.au", "consolidatedtenders.com"]):
+        if "/tender/" in low and ("id=" in low or any(p in low for p in DETAIL_PATTERNS)):
+            return True
+    return False
 
 def add_pagination(url: str, page_num: int) -> str:
     if page_num <= 1:
@@ -175,64 +183,77 @@ def score_from(title: str, body: str) -> Tuple[int, Dict[str,int]]:
         "energy_title": t_energy, "energy_body": b_energy
     }
 
-# ---- Main ----
 def run():
     session = make_session()
 
-    # 1) Probe listing endpoints; ALWAYS save page-1 HTML for debugging
-    chosen = None
+    chosen_abs = None
     page1_links: List[Dict] = []
     page1_html_dump = ""
-    for cand in LIST_URL_CANDIDATES:
-        html = fetch(cand, session)
-        if not page1_html_dump:
-            page1_html_dump = html or ""
-        links = parse_listing_for_detail_links(html)
-        logging.info(f"Probe {cand} -> {len(links)} link(s)")
-        if links:
-            chosen = cand
-            page1_links = links
+
+    # probe bases x list candidates
+    for base in BASES:
+        for path in LIST_URL_CANDIDATES:
+            list_url = normalize_url(base, path)
+            html = fetch(list_url, session)
+            if not page1_html_dump:
+                page1_html_dump = html or ""
+            candidates = collect_link_candidates(html, base)
+            # debug anchors (first page only, first base that returns anything)
+            if candidates and not page1_links:
+                page1_links = [c for c in candidates if is_detail_link(c["href"])]
+                chosen_abs = list_url if page1_links else None
+            logging.info(f"Probe {list_url} -> {len(candidates)} anchor-like; "
+                         f"{len([c for c in candidates if is_detail_link(c['href'])])} detail-like")
+            if page1_links:
+                break
+        if page1_links:
             break
 
-    # Save page-1 listing HTML unconditionally so we can inspect
+    # Always save the first listing HTML so we can see what the site returned
     try:
         with open("vic-listing.html", "w", encoding="utf-8") as f:
             f.write(page1_html_dump or "")
     except Exception:
         pass
 
-    if not chosen:
-        # No links discovered: write empty JSONs and exit gracefully
+    # Save a compact dump of the link-like things we saw
+    try:
+        dbg = [{"href": c["href"], "text": c.get("text",""), "src": c.get("src","")}
+               for c in (page1_links or [])][:200]
+        with open("vic-debug-anchors.json", "w", encoding="utf-8") as f:
+            json.dump(dbg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    if not page1_links:
+        # No detail links found
         for name in ("vic-raw.json", "vic-links.json", "vic-near.json"):
             with open(name, "w", encoding="utf-8") as f:
                 json.dump([], f, ensure_ascii=False, indent=2)
-        logging.warning("VIC: No detail links found in probed listings (see vic-listing.html).")
+        logging.warning("VIC: No detail links found (see vic-listing.html and vic-debug-anchors.json).")
         print("OK (no links)")
         return
 
-    # 2) Collect across pages
+    # gather across pages (reuse chosen_abs)
     all_items: List[Dict] = []
     for i in range(1, max(1, PAGES) + 1):
-        url_i = chosen if i == 1 else add_pagination(chosen, i)
-        logging.info(f"Listing page {i}: {url_i}")
+        url_i = chosen_abs if i == 1 else add_pagination(chosen_abs, i)
         html = fetch(url_i, session)
-        items = parse_listing_for_detail_links(html)
-        if i == 1 and page1_links:
-            items = page1_links
-            page1_links = []
-        logging.info(f"  found {len(items)} detail anchor(s)")
-        all_items.extend(items)
+        cand_i = collect_link_candidates(html, urlparse(url_i).scheme + "://" + urlparse(url_i).netloc)
+        detail_i = [c for c in cand_i if is_detail_link(c["href"])]
+        logging.info(f"Page {i}: {len(cand_i)} anchor-like; {len(detail_i)} detail-like")
+        all_items.extend(detail_i)
         time.sleep(0.3 + random.uniform(0, 0.3))
 
-    # Deduplicate
+    # dedupe on href
     seen, uniq = set(), []
     for it in all_items:
-        href = it["href"]
-        if href not in seen:
-            seen.add(href)
+        h = it["href"]
+        if h not in seen:
+            seen.add(h)
             uniq.append(it)
 
-    # 3) Peek at a limited number of detail pages
+    # peek at some detail pages (helps filtering/scoring)
     details_text: Dict[str, Dict[str, str]] = {}
     for it in uniq[:DETAIL_LIMIT]:
         url = it["href"]
@@ -241,7 +262,7 @@ def run():
         details_text[url] = {"title": title, "body": body}
         time.sleep(0.2 + random.uniform(0, 0.2))
 
-    # 4) Build rows and classify (strict + near-miss)
+    # classify
     rows_all: List[Dict] = []
     rows_near: List[Dict] = []
 
@@ -281,7 +302,7 @@ def run():
                 "note": "Near-miss: energy + inspection/survey terms, no explicit drone keyword"
             })
 
-    # Sort & output
+    # sort & write
     rows_all.sort(key=lambda r: (-r["score"], r["title"].lower()))
     rows_near.sort(key=lambda r: (-r["score"], r["title"].lower()))
     rows_out = [r for r in rows_all if r["include"]] if ONLY_FILTERED else rows_all
@@ -294,8 +315,7 @@ def run():
         with open("vic-near.json", "w", encoding="utf-8") as f:
             json.dump(rows_near, f, ensure_ascii=False, indent=2)
 
-    logging.info(f"VIC: wrote {len(rows_out)} strict rows; {len(rows_near)} near-miss rows "
-                 f"(filtered={ONLY_FILTERED}, drone_required={DRONE_REQUIRED}).")
+    logging.info(f"VIC: wrote {len(rows_out)} strict rows; {len(rows_near)} near-miss rows.")
     print("OK")
 
 if __name__ == "__main__":
