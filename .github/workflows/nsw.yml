@@ -1,0 +1,53 @@
+name: NSW scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "Listing pages to scan"
+        required: false
+        default: "1"
+      detail_limit:
+        description: "Detail pages to peek (for filtering)"
+        required: false
+        default: "20"
+      only_filtered:
+        description: "1=only filtered, 0=all"
+        required: false
+        default: "1"
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Scrape NSW
+        env:
+          PAGES: ${{ github.event.inputs.pages || '1' }}
+          DETAIL_LIMIT: ${{ github.event.inputs.detail_limit || '20' }}
+          ONLY_FILTERED: ${{ github.event.inputs.only_filtered || '1' }}
+        run: |
+          set -e
+          python scrape_nsw.py
+          echo "Preview nsw-links.json:"
+          head -n 60 nsw-links.json || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsw-output
+          path: |
+            nsw-links.json
+            nsw-raw.json
