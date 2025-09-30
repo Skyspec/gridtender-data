@@ -10,13 +10,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # ---- QLD (QTenders) ----
 BASE = "https://qtenders.epw.qld.gov.au"
 
-# Reliable listing endpoints (we'll try in order until we see detail links)
+# Listing endpoints to probe (use the first that yields detail links)
 LIST_URL_CANDIDATES = [
-    # Official "Open tenders" advanced search
     f"{BASE}/qtenders/tender/search/tender-search.do?action=advanced-tender-search-open-tender",
-    # Alternate "do-advanced" with explicit Open state
     f"{BASE}/qtenders/tender/search/tender-search.do?action=do-advanced-tender-search&state=Open",
-    # Basic entry (sometimes contains the list for not-logged-in users)
     f"{BASE}/qtenders/qtenders/",
 ]
 
@@ -25,7 +22,12 @@ PAGES          = int(os.getenv("PAGES", "2") or "2")            # listing pages 
 DETAIL_LIMIT   = int(os.getenv("DETAIL_LIMIT", "40") or "40")   # how many detail pages to peek (text only)
 TIMEOUT        = int(os.getenv("TIMEOUT", "20") or "20")        # HTTP timeout
 ONLY_FILTERED  = os.getenv("ONLY_FILTERED", "1").lower() in ("1","true","yes","y")
-DRONE_REQUIRED = True  # strict like NSW
+
+# Strict: a drone signal is required for qld-links.json
+DRONE_REQUIRED = True
+
+# Also write a "near misses" file (energy + generic inspection/survey; no explicit drone)
+WRITE_NEAR = os.getenv("WRITE_NEAR", "1").lower() in ("1","true","yes","y")
 
 # ---- Drone & Energy filters (strict) ----
 PRIMARY_DRONE_PATTERNS = [
@@ -42,6 +44,16 @@ ENERGY_PATTERNS = [
     r"\bbattery(?:\s+storage)?\b", r"\bBESS\b",
     r"\bO&M\b", r"\boperations?\s+and\s+maintenance\b", r"\bfarm\b"
 ]
+# Generic “work-like” words for near-miss detection (used ONLY when no drone hit)
+GENERIC_WORK_PATTERNS = [
+    r"\binspect(?:ion|ions)?\b",
+    r"\bsurvey(?:s|ing)?\b",
+    r"\bmapping\b",
+    r"\bmaintenance\b",
+    r"\bcondition\s+assessment\b",
+    r"\bvegetation\b",
+]
+
 NEGATIVE_PATTERNS = [
     r"\bconnecting with country\b",
     r"\bdesign review panel\b",
@@ -56,6 +68,7 @@ NEGATIVE_PATTERNS = [
 
 DRONE_RE    = re.compile("|".join(PRIMARY_DRONE_PATTERNS), re.I)
 ENERGY_RE   = re.compile("|".join(ENERGY_PATTERNS), re.I)
+GENERIC_RE  = re.compile("|".join(GENERIC_WORK_PATTERNS), re.I)
 NEGATIVE_RE = re.compile("|".join(NEGATIVE_PATTERNS), re.I)
 
 # ---- HTTP helpers ----
@@ -64,12 +77,11 @@ def make_session() -> requests.Session:
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36 GridTender/QLD-0.2")
+                       "Chrome/126.0 Safari/537.36 GridTender/QLD-0.3")
     })
     return s
 
 def fetch(url: str, session: requests.Session, timeout: int = TIMEOUT) -> str:
-    """GET with simple retry and SSL verify fallback."""
     for i in range(2):
         try:
             r = session.get(url, timeout=timeout, allow_redirects=True, verify=(i == 0))
@@ -92,7 +104,7 @@ def normalize_url(base: str, href: str) -> str:
 def parse_listing_for_detail_links(html: str) -> List[Dict]:
     """
     Return [{'href': '<abs>', 'text': '...'}] for QTenders detail pages.
-    We match links that include 'tender/display' AND 'tender-details' to avoid nav/JS links.
+    Match links that include 'tender/display' AND 'tender-details'.
     """
     out, seen = [], set()
     if not html:
@@ -109,7 +121,6 @@ def parse_listing_for_detail_links(html: str) -> List[Dict]:
     return out
 
 def add_pagination(url: str, page_num: int) -> str:
-    """Generate page N by setting currentPage=N when applicable."""
     if page_num <= 1:
         return url
     u = urlparse(url)
@@ -119,7 +130,6 @@ def add_pagination(url: str, page_num: int) -> str:
     return urlunparse(url1)
 
 def parse_detail_title_and_body(html: str) -> Tuple[str, str]:
-    """Basic parse (no JS)."""
     if not html:
         return "", ""
     soup = BeautifulSoup(html, "html.parser")
@@ -139,7 +149,7 @@ def link_title_from_href(href: str, text_hint: str) -> str:
     except Exception:
         return "Untitled"
 
-# ---- Scoring ----
+# ---- Scoring & inclusion ----
 def count_hits(regex: re.Pattern, text: str) -> int:
     return len(regex.findall(text or ""))
 
@@ -165,9 +175,9 @@ def run():
     for cand in LIST_URL_CANDIDATES:
         html = fetch(cand, session)
         links = parse_listing_for_detail_links(html)
-        logging.info(f"Probe {cand} -> {len(links)} detail link(s)")
+        logging.info(f"Probe {cand} -> {len(links)} link(s)")
         if not chosen:
-            page1_html_dump = html  # keep first for debugging if needed
+            page1_html_dump = html
         if links:
             chosen = cand
             page1_links = links
@@ -180,10 +190,9 @@ def run():
                 f.write(page1_html_dump or "")
         except Exception:
             pass
-        with open("qld-raw.json", "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
-        with open("qld-links.json", "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
+        for name in ("qld-raw.json", "qld-links.json", "qld-near.json"):
+            with open(name, "w", encoding="utf-8") as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
         logging.warning("QLD: No detail links found. Wrote qld-listing.html for debugging.")
         print("OK (no links)")
         return
@@ -219,8 +228,10 @@ def run():
         details_text[url] = {"title": title, "body": body}
         time.sleep(0.2 + random.uniform(0, 0.2))
 
-    # 4) Build rows and filter
+    # 4) Build rows and classify (strict + near-miss)
     rows_all: List[Dict] = []
+    rows_near: List[Dict] = []
+
     for it in uniq:
         url = it["href"]
         dt = details_text.get(url, {})
@@ -229,30 +240,48 @@ def run():
         text_combo = f"{title_text} {body_text}"
 
         score, hits = score_from(title_text, body_text)
-        drone_hits_total = hits["drone_title"] + hits["drone_body"]
+        drone_hits_total  = hits["drone_title"] + hits["drone_body"]
+        energy_hits_total = hits["energy_title"] + hits["energy_body"]
         negative_hit = bool(NEGATIVE_RE.search(text_combo))
+        generic_hits = len(GENERIC_RE.findall(text_combo))
 
-        include = (drone_hits_total > 0) and (True if drone_hits_total > 0 else not negative_hit)
+        include_strict = (drone_hits_total > 0) and (True if drone_hits_total > 0 else not negative_hit)
+        include_near = (drone_hits_total == 0) and (energy_hits_total > 0) and (generic_hits > 0) and (not negative_hit)
 
-        rows_all.append({
+        row = {
             "title": title_text,
             "source_url": url,
             "state": "QLD",
             "score": score,
             "hits": hits,
-            "include": include
-        })
+            "include": include_strict
+        }
+        rows_all.append(row)
+        if include_near:
+            rows_near.append({
+                "title": title_text,
+                "source_url": url,
+                "state": "QLD",
+                "score": score,
+                "hits": {**hits, "generic": generic_hits},
+                "note": "Near-miss: energy + inspection/survey terms, no explicit drone keyword"
+            })
 
     # Sort & output
     rows_all.sort(key=lambda r: (-r["score"], r["title"].lower()))
+    rows_near.sort(key=lambda r: (-r["score"], r["title"].lower()))
     rows_out = [r for r in rows_all if r["include"]] if ONLY_FILTERED else rows_all
 
     with open("qld-raw.json", "w", encoding="utf-8") as f:
         json.dump(rows_all, f, ensure_ascii=False, indent=2)
     with open("qld-links.json", "w", encoding="utf-8") as f:
         json.dump(rows_out, f, ensure_ascii=False, indent=2)
+    if WRITE_NEAR:
+        with open("qld-near.json", "w", encoding="utf-8") as f:
+            json.dump(rows_near, f, ensure_ascii=False, indent=2)
 
-    logging.info(f"QLD: wrote {len(rows_out)} rows (filtered={ONLY_FILTERED}, drone_required={DRONE_REQUIRED}).")
+    logging.info(f"QLD: wrote {len(rows_out)} strict rows; {len(rows_near)} near-miss rows "
+                 f"(filtered={ONLY_FILTERED}, drone_required={DRONE_REQUIRED}).")
     print("OK")
 
 if __name__ == "__main__":
